@@ -855,7 +855,70 @@ def pythia_1_4_b_dict(cfg: EnsembleArgs):
     dict_ratio = 6
     l1_values = np.logspace(-4, -2, 5)
     dict_size = int(cfg.activation_width * dict_ratio)
-    devices = ["cuda:1"]
+    devices = ["cuda:0"]
+
+    ensembles = []
+    for i in range(1):
+        # l1_range = l1_values[i*2:(i+1)*2]
+        models = [FunctionalTiedSAE.init(cfg.activation_width, dict_size, l1_value, dtype=cfg.dtype) for l1_value in l1_values]
+        device = devices.pop()
+        ensemble = FunctionalEnsemble(models, FunctionalTiedSAE, torchopt.adam, {"lr": cfg.lr}, device=device)
+        args = {"batch_size": cfg.batch_size, "device": device, "dict_size": dict_size}
+        ensemble = FunctionalEnsemble(
+            models, FunctionalTiedSAE,
+            torchopt.adam, {
+                "lr": cfg.lr
+            },
+            device=device
+        )
+        args = {"batch_size": cfg.batch_size, "device": device, "dict_size": dict_size}
+        name = f"l1_{i}"
+        ensembles.append((ensemble, args, name))
+
+    return (
+        ensembles,
+        [],
+        ["l1_alpha", "dict_size"],
+        {"dict_size": [dict_size], "l1_alpha": [l1_values]},
+    )
+
+def run_pythia_1_4_b_sweep() -> None:
+    cfg = EnsembleArgs()
+
+    cfg.is_othello = False
+
+    cfg.model_name = "EleutherAI/pythia-1.4B-deduped"
+    cfg.dataset_name = "NeelNanda/pile-10k"
+
+    cfg.batch_size = 1024
+    cfg.lr = 1e-3
+    cfg.dtype = torch.float32
+
+    cfg.use_wandb = False
+    cfg.wandb_images = False
+    cfg.use_synthetic_dataset = False
+
+    cfg.device = "cuda:0"
+    cfg.n_chunks = 30
+
+    cfg.n_epochs = 10
+
+    cfg.layer = 6
+    cfg.layer_loc = "residual"
+
+    cfg.n_repetitions = None
+    cfg.center_activations = False
+
+    cfg.dataset_folder = "activation_data_1_4_b"
+    cfg.output_folder = "output_1_4_b"
+    sweep(pythia_1_4_b_dict, cfg)
+
+
+def othello_gpt_dict(cfg: EnsembleArgs):
+    dict_ratio = 6
+    l1_values = np.logspace(-4, -2, 5)
+    dict_size = int(cfg.activation_width * dict_ratio)
+    devices = ["cuda:0"]
 
     ensembles = []
     for i in range(1):
@@ -883,11 +946,14 @@ def pythia_1_4_b_dict(cfg: EnsembleArgs):
     )
 
 
-def run_pythia_1_4_b_sweep() -> None:
+def run_othello_gpt_sweep() -> None:
     cfg = EnsembleArgs()
 
-    cfg.model_name = "EleutherAI/pythia-1.4B-deduped"
-    cfg.dataset_name = "NeelNanda/pile-10k"
+    cfg.is_othello = True
+
+    cfg.model_name = "NeelNanda/Othello-GPT-Transformer-Lens"
+    cfg.model_type = "synthetic_model.pth"
+    cfg.dataset_name = "data/othello_synthetic"
 
     cfg.batch_size = 1024
     cfg.lr = 1e-3
@@ -897,17 +963,20 @@ def run_pythia_1_4_b_sweep() -> None:
     cfg.wandb_images = False
     cfg.use_synthetic_dataset = False
 
-    cfg.device = "cuda:1"
+    cfg.device = "cuda:0"
     cfg.n_chunks = 30
 
     cfg.n_epochs = 10
 
-    cfg.layer = 6
+    cfg.layer = 4
     cfg.layer_loc = "residual"
 
-    cfg.dataset_folder = "activation_data_1_4_b"
-    cfg.output_folder = "output_1_4_b"
-    sweep(pythia_1_4_b_dict, cfg)
+    cfg.n_repetitions = None
+    cfg.center_activations = False
+
+    cfg.dataset_folder = "activation_data_othello_gpt_synthetic"
+    cfg.output_folder = "output_othello_gpt_synthetic"
+    sweep(othello_gpt_dict, cfg)
 
 
 def run_zeros_only(cfg: EnsembleArgs):
@@ -1283,4 +1352,5 @@ if __name__ == "__main__":
     # run_all_zeros(device, layer)
     # setup_positives()
     #run_single_layer()
+    #run_othello_gpt_sweep()
     run_pythia_1_4_b_sweep()
