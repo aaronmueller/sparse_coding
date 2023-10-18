@@ -13,7 +13,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.utils.data as data
 import tqdm
-from transformer_lens import HookedTransformer
+import transformer_lens.utils as tl_utils
+from transformer_lens import HookedTransformer, HookedTransformerConfig
 from transformers import GPT2Tokenizer
 
 import standard_metrics
@@ -26,7 +27,24 @@ from sc_datasets.random_dataset import SparseMixDataset
 
 
 def get_model(cfg):
-    if check_transformerlens_model(cfg.model_name):
+    if cfg.is_othello:
+        model_config = HookedTransformerConfig(
+            n_layers = 8,
+            d_model = 512,
+            d_head = 64,
+            n_heads = 8,
+            d_mlp = 2048,
+            d_vocab = 61,
+            n_ctx = 59,
+            act_fn="gelu",
+            normalization_type="LNPre"
+        )
+        model = HookedTransformer(model_config)
+        state_dict = tl_utils.download_file_from_hf("NeelNanda/Othello-GPT-Transformer-Lens", "synthetic_model.pth")
+        model.load_state_dict(state_dict)
+        model.config = model_config
+        tokenizer = None
+    elif check_transformerlens_model(cfg.model_name):
         model = HookedTransformer.from_pretrained(cfg.model_name, device=cfg.device)
     else:
         raise ValueError("Model name not recognised")
@@ -238,7 +256,21 @@ def generate_synthetic_dataset(cfg, generator, chunk_size, n_chunks):
 
 
 def init_model_dataset(cfg):
-    cfg.activation_width = get_activation_size(cfg.model_name, cfg.layer_loc)
+    if cfg.is_othello:
+        model_config = HookedTransformerConfig(
+            n_layers = 8,
+            d_model = 512,
+            d_head = 64,
+            n_heads = 8,
+            d_mlp = 2048,
+            d_vocab = 61,
+            n_ctx = 59,
+            act_fn="gelu",
+            normalization_type="LNPre"
+        )
+    else:
+        model_config = None
+    cfg.activation_width = get_activation_size(cfg.model_name, cfg.layer_loc, othello_cfg=model_config)
 
     if len(os.listdir(cfg.dataset_folder)) == 0:
         print(f"Activations in {cfg.dataset_folder} do not exist, creating them")
@@ -254,6 +286,7 @@ def init_model_dataset(cfg):
             device=cfg.device,
             chunk_size_gb=cfg.chunk_size_gb,
             center_dataset=cfg.center_dataset,
+            is_othello=cfg.is_othello
         )
         del transformer, tokenizer
         return n_datapoints
@@ -381,6 +414,8 @@ def sweep(ensemble_init_func, cfg):
             torch.save(learned_dicts, os.path.join(cfg.iter_folder, "learned_dicts.pt"))
             # save the config as a yaml file
             with open(os.path.join(cfg.iter_folder, "config.yaml"), "w") as f:
-                yaml.dump(dict(cfg), f)
+                cfg_yaml = dict(vars(cfg))
+                cfg_yaml.pop("dtype")
+                yaml.dump(cfg_yaml, f)
 
         print("\n")
