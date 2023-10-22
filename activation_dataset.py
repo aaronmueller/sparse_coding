@@ -22,6 +22,8 @@ import wandb
 
 from baukit import Trace
 from datasets import Dataset, DatasetDict, load_dataset
+from data.othello_data import get as get_othello
+from data.dataset import CharDataset
 from einops import rearrange
 from torch.utils.data import DataLoader
 from torchtyping import TensorType
@@ -42,21 +44,32 @@ MAX_SENTENCE_LEN = 256
 def check_use_baukit(model_name):
     if model_name in ["nanoGPT"]:
         return True
-    elif check_transformerlens_model(model_name):
+    elif model_name in ("NeelNanda/Othello-GPT-Transformer-Lens",) or check_transformerlens_model(model_name):
         return False
     else:
         raise NotImplementedError(f"Unknown if model {model_name} uses baukit")
 
 
-def get_activation_size(model_name: str, layer_loc: str):
-    assert check_transformerlens_model(model_name) or model_name == "nanoGPT", f"Model {model_name} not supported"
+def get_activation_size(model_name: str, layer_loc: str, othello_cfg=None):
+    assert check_transformerlens_model(model_name) or model_name in ("nanoGPT", "NeelNanda/Othello-GPT-Transformer-Lens"), f"Model {model_name} not supported"
     assert layer_loc in [
         "residual",
         "mlp",
         "attn",
         "mlpout",
     ], f"Layer location {layer_loc} not supported"
-    model_cfg = convert_hf_model_config(model_name)
+    if othello_cfg:
+        model_cfg = othello_cfg
+        if layer_loc == "residual":
+            return model_cfg.d_model
+        elif layer_loc == "mlp":
+            return model_cfg.d_mlp
+        elif layer_loc == "attn":
+            return model_cfg.d_head * model_cfg.n_heads
+        elif layer_loc == "mlpout":
+            return model_cfg.d_model
+    else:
+        model_cfg = convert_hf_model_config(model_name)
     if layer_loc == "residual":
         return model_cfg["d_model"]
     elif layer_loc == "mlp":
@@ -75,6 +88,7 @@ def check_transformerlens_model(model_name: str):
         return False
 
 
+# TODO
 def make_tensor_name(layer: int, layer_loc: str, model_name: str) -> str:
     """Make the tensor name for a given layer and model."""
     assert layer_loc in [
@@ -84,24 +98,24 @@ def make_tensor_name(layer: int, layer_loc: str, model_name: str) -> str:
         "mlpout",
     ], f"Layer location {layer_loc} not supported"
     if layer_loc == "residual":
-        if check_transformerlens_model(model_name):
+        if check_transformerlens_model(model_name) or model_name == "NeelNanda/Othello-GPT-Transformer-Lens":
             tensor_name = f"blocks.{layer}.hook_resid_post"
         else:
             raise NotImplementedError(f"Model {model_name} not supported for residual stream")
     elif layer_loc == "mlp":
-        if check_transformerlens_model(model_name):
+        if check_transformerlens_model(model_name) or model_name == "NeelNanda/Othello-GPT-Transformer-Lens":
             tensor_name = f"blocks.{layer}.mlp.hook_post"
         elif model_name == "nanoGPT":
             tensor_name = f"transformer.h.{layer}.mlp.c_fc"
         else:
             raise NotImplementedError(f"Model {model_name} not supported for MLP")
     elif layer_loc == "attn":
-        if check_transformerlens_model(model_name):
+        if check_transformerlens_model(model_name) or model_name == "NeelNanda/Othello-GPT-Transformer-Lens":
             tensor_name = f"blocks.{layer}.hook_resid_post"
         else:
             raise NotImplementedError(f"Model {model_name} not supported for attention stream")
     elif layer_loc == "mlpout":
-        if check_transformerlens_model(model_name):
+        if check_transformerlens_model(model_name) or model_name == "NeelNanda/Othello-GPT-Transformer-Lens":
             tensor_name = f"blocks.{layer}.hook_mlp_out"
         else:
             raise NotImplementedError(f"Model {model_name} not supported for MLP")
@@ -121,7 +135,7 @@ def read_from_pile(address: str, max_lines: int = 100_000, start_line: int = 0):
             yield json.loads(line)
 
 
-def make_sentence_dataset(dataset_name: str, max_lines: int = 20_000, start_line: int = 0):
+def make_sentence_dataset(dataset_name: str, max_lines: int = 20_000, start_line: int = 0, is_othello: bool = False):
     """Returns a dataset from the Huggingface Datasets library."""
     if dataset_name == "EleutherAI/pile":
         if not os.path.exists("pile0"):
@@ -130,6 +144,8 @@ def make_sentence_dataset(dataset_name: str, max_lines: int = 20_000, start_line
                 os.system("curl https://the-eye.eu/public/AI/pile/train/00.jsonl.zst > pile0.zst")
                 os.system("unzstd pile0.zst")
         dataset = Dataset.from_list(list(read_from_pile("pile0", max_lines=max_lines, start_line=start_line)))
+    elif is_othello:
+        dataset = load_dataset("json", data_files="data/othello_hf.json", split=f"train[:{max_lines}]")
     else:
         dataset = load_dataset(dataset_name, split="train")#, split=f"train[{start_line}:{start_line + max_lines}]")
     return dataset
@@ -238,6 +254,98 @@ def chunk_and_tokenize(
     return data.with_format(format, columns=["input_ids"]), (total_tokens / total_bytes) / math.log(2)
 
 
+def chunk_and_tokenize_othello(
+    data: T,
+    format: str = "torch",
+    num_proc: int = min(mp.cpu_count() // 2, 8),
+    text_key: str = "text",
+    load_from_cache_file: bool = True,
+) -> Tuple[T, float]:
+    """Perform GPT-style chunking and tokenization on a dataset.
+
+    The resulting dataset will consist entirely of chunks exactly `max_length` tokens
+    long. Long sequences will be split into multiple chunks, and short sequences will
+    be merged with their neighbors, using `eos_token` as a separator. The fist token
+    will also always be an `eos_token`.
+
+    Args:
+        data: The dataset to chunk and tokenize.
+        tokenizer: The tokenizer to use.
+        format: The format to return the dataset in, passed to `Dataset.with_format`.
+        num_proc: The number of processes to use for tokenization.
+        text_key: The key in the dataset to use as the text to tokenize.
+        max_length: The maximum length of a batch of input ids.
+        return_final_batch: Whether to return the final batch, which may be smaller
+            than the others.
+        load_from_cache_file: Whether to load from the cache file.
+
+    Returns:
+        * The chunked and tokenized dataset.
+        * The ratio of nats to bits per byte see https://arxiv.org/pdf/2101.00027.pdf,
+            section 3.1.
+    """
+
+    def _tokenize_fn(x: Dict[str, list]):
+        output = {"input_ids": torch.IntTensor(x[text_key][:-1])}
+
+        """
+        if overflow := output.pop("overflowing_tokens", None):
+            # Slow Tokenizers return unnested lists of ints
+            assert isinstance(output["input_ids"][0], int)
+
+            # Chunk the overflow into batches of size `chunk_size`
+            chunks = [output] + [
+                overflow[i * chunk_size : (i + 1) * chunk_size] for i in range(math.ceil(len(overflow) / chunk_size))
+            ]
+
+        total_tokens = sum(len(ids) for ids in output)
+        total_bytes = len(joined_text.encode("utf-8"))
+
+        if not return_final_batch:
+            # We know that the last sample will almost always be less than the max
+            # number of tokens, and we don't want to pad, so we just drop it.
+            output = {k: v[:-1] for k, v in output.items()}
+        """
+        total_tokens = len(output["input_ids"])
+        total_bytes = len(output["input_ids"]*4)
+        output_batch_size = len(output["input_ids"])
+
+        if output_batch_size == 0:
+            raise ValueError(
+                "Not enough data to create a single batch complete batch."
+                " Either allow the final batch to be returned,"
+                " or supply more data."
+            )
+
+        # We need to output this in order to compute the number of bits per byte
+        div, rem = divmod(total_tokens, output_batch_size)
+        output["length"] = [div] * output_batch_size
+        output["length"][-1] += rem
+
+        div, rem = divmod(total_bytes, output_batch_size)
+        output["bytes"] = [div] * output_batch_size
+        output["bytes"][-1] += rem
+
+        return output
+
+    print(data)
+    data = data.map(
+        _tokenize_fn,
+        # Batching is important for ensuring that we don't waste tokens
+        # since we always throw away the last element of the batch we
+        # want to keep the batch size as large as possible
+        batched=False,
+        batch_size=2048,
+        num_proc=num_proc,
+        remove_columns=get_columns_all_equal(data),
+        load_from_cache_file=load_from_cache_file,
+    )
+    
+    #total_bytes: float = sum(data["bytes"])
+    #total_tokens: float = sum(data["length"])
+    return data.with_format(format, columns=["input_ids"]), 2.0
+
+
 def get_columns_all_equal(dataset: Union[Dataset, DatasetDict]) -> List[str]:
     """Get a single list of columns in a `Dataset` or `DatasetDict`.
 
@@ -288,7 +396,7 @@ def make_activation_dataset(
         dataset = []
         n_saved_chunks = 0
         for batch_idx, batch in tqdm(enumerate(sentence_dataset)):
-            batch = batch["input_ids"].to(device)
+            batch = batch["input_ids"].to("cuda:0")
             if baukit:
                 # Don't have nanoGPT models integrated with transformer_lens so using baukit for activations
                 with Trace(model, tensor_name) as ret:
@@ -410,18 +518,28 @@ def setup_data(
     skip_chunks: int = 0,
     device: torch.device = torch.device("cuda:0"),
     center_dataset: bool = False,
+    is_othello: bool = False
 ):
     layers = [layer] if isinstance(layer, int) else layer
 
     sentence_len_lower = 1000
-    activation_width = get_activation_size(model.cfg.model_name, layer_loc)
+
+    if is_othello:
+        othello_cfg = model.config
+        model.cfg.model_name = "NeelNanda/Othello-GPT-Transformer-Lens"
+    else:
+        othello_cfg = None
+    activation_width = get_activation_size(model.cfg.model_name, layer_loc, othello_cfg=othello_cfg)
     baukit = check_use_baukit(model.cfg.model_name)
     max_lines = int((chunk_size_gb * 1e9 * n_chunks) / (activation_width * sentence_len_lower * 2))
     print(f"Setting max_lines to {max_lines} to minimize sentences processed")
 
-    sentence_dataset = make_sentence_dataset(dataset_name, max_lines=max_lines, start_line=start_line)
+    sentence_dataset = make_sentence_dataset(dataset_name, max_lines=max_lines, start_line=start_line, is_othello=is_othello)
     tensor_names = [make_tensor_name(layer, layer_loc, model.cfg.model_name) for layer in layers]
-    tokenized_sentence_dataset, bits_per_byte = chunk_and_tokenize(sentence_dataset, tokenizer, max_length=MAX_SENTENCE_LEN)
+    if is_othello:
+        tokenized_sentence_dataset, bits_per_byte = chunk_and_tokenize_othello(sentence_dataset)
+    else:
+        tokenized_sentence_dataset, bits_per_byte = chunk_and_tokenize(sentence_dataset, tokenizer, max_length=MAX_SENTENCE_LEN)
     token_loader = DataLoader(tokenized_sentence_dataset, batch_size=MODEL_BATCH_SIZE, shuffle=True)
     if baukit:
         assert type(dataset_folder) == str, "Baukit only supports single dataset folder"
