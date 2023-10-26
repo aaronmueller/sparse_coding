@@ -29,7 +29,7 @@ from activation_dataset import check_use_baukit, make_tensor_name
 from config import BaseArgs, InterpArgs, InterpGraphArgs
 from autoencoders.learned_dict import LearnedDict
 from othello_utils import othello_utils
-from scipy.stats import spearmanr
+from scipy.stats import spearmanr, pointbiserialr
 
 # set OPENAI_API_KEY environment variable from secrets.json['openai_key']
 # needs to be done before importing openai interp bits
@@ -488,8 +488,7 @@ def run_othello(dict: LearnedDict, cfg: InterpArgs):
         device=cfg.device,
         is_othello=cfg.is_othello
     )
-    print("Evaluating Othello features...")
-    eval_othello(df)
+    return df
 
 def get_score(lines: List[str], mode: str):
     if mode == "top":
@@ -860,7 +859,8 @@ def read_results(activation_name: str, score_mode: str) -> None:
     plt.savefig(save_path)
 
 
-def interpret_othello(dict_location, feat_proportion=0.1):
+def interpret_othello(dict_location, feat_proportion=0.1,
+                      significance_threshold=.05):
     base_cfg = InterpArgs()
 
     dict_dir = os.path.dirname(dict_location)
@@ -881,6 +881,23 @@ def interpret_othello(dict_location, feat_proportion=0.1):
         dict_location,
         map_location=cfg.device,
     )
+
+    if not isinstance(autoencoders, list) and "baselines" in dict_dir:
+        save_str = f"eval_output/{os.path.basename(dict_location).split('.pt')[0]}"
+        cfg.load_interpret_autoencoder = dict_location
+        cfg.layer = dict_dir.split("/")[-1][1]
+        cfg.activation_width = autoencoders.activation_size
+        cfg.layer_loc = dict_dir.split("/")[-1].split("_")[1]
+        cfg.save_loc = os.path.join(dict_dir, save_str)
+        cfg.df_n_feats = autoencoders.n_feats
+        cfg.n_feats_explain = feat_proportion * cfg.df_n_feats
+
+        df = run_othello(autoencoders, cfg)
+        print("Evaluating Othello features...")
+        eval_othello(df, num_ae_features=int(cfg.n_feats_explain),
+                     significance_threshold=significance_threshold)
+        return
+
     # find ae with matching l1_val
     for autoencoder in autoencoders:
         l1_val = autoencoder[1]["l1_alpha"]
@@ -898,11 +915,16 @@ def interpret_othello(dict_location, feat_proportion=0.1):
         cfg.activation_width = activation_width
         cfg.layer_loc = layer_loc
         cfg.save_loc = os.path.join(dict_dir, save_str)
-        cfg.df_n_feats = int(ratio * cfg.activation_width)
-        n_feats_explain = int(feat_proportion * cfg.df_n_feats)  # analyze all features
+        cfg.df_n_feats = int(6 * cfg.activation_width)
+        cfg.n_feats_explain = int(feat_proportion * cfg.df_n_feats)  # analyze all features
+        print(cfg.n_feats_explain)
 
         # get activations
-        run_othello(encoder, cfg)
+        df = run_othello(encoder, cfg)
+        print("Evaluating Othello features...")
+        eval_othello(df, num_ae_features=int(cfg.n_feats_explain),
+                     significance_threshold=significance_threshold)
+
 
 
 def eval_othello(df,
@@ -922,45 +944,69 @@ def eval_othello(df,
                 feat_name = f"{state}_{row}{col}"
                 board_features[feat_name] = []
 
-    game_len = 58
-    for example in df.iterrows():
-        board = othello_utils.OthelloBoardState()
-        game = example[1]["fragment_token_ids"][:game_len+1]
-        board.update(othello_utils.to_string(game))
-        # fill ground-truth labels (binary)
-        for board_feature in board_features.keys():
-            color, _, row, col = board_feature
-            row = row_to_idx[row]
-            col = int(col)
-            if board.state[row][col] == -1 and color == "w":
-                board_features[board_feature].append(1)
-            elif board.state[row][col] == 1 and color == "b":
-                board_features[board_feature].append(1)
-            elif board.state[row][col] == 0 and color == "e":
-                board_features[board_feature].append(1)
-            else:
-                board_features[board_feature].append(0)
-        # fill autoencoder features (continuous)
-        for feature_num in range(num_ae_features):
-            if feature_num not in feature_activations:
-                feature_activations[feature_num] = []
-            feature_activations[feature_num].append(example[1][f"feature_{feature_num}_activation_{game_len}"])
+    seed = 0
+    for game_len in (0, 15, 30, 45, 58):
+        # Run with different game lengths (s.t. we actually see every feature)
+        for example in df.iterrows():
+            board = othello_utils.OthelloBoardState()
+            game = example[1]["fragment_token_ids"][:game_len+1]
+            board.update(othello_utils.to_string(game))
+            # fill ground-truth labels (binary)
+            for board_feature in board_features.keys():
+                color, _, row, col = board_feature
+                row = row_to_idx[row]
+                col = int(col)
+                if board.state[row][col] == -1 and color == "w":
+                    board_features[board_feature].append(1)
+                elif board.state[row][col] == 1 and color == "b":
+                    board_features[board_feature].append(1)
+                elif board.state[row][col] == 0 and color == "e":
+                    board_features[board_feature].append(1)
+                else:
+                    board_features[board_feature].append(0)
+            # fill autoencoder features (continuous)
+            for feature_num in range(num_ae_features):
+                if feature_num not in feature_activations:
+                    feature_activations[feature_num] = []
+                activation = example[1][f"feature_{feature_num}_activation_{game_len}"]
+                # parity trick
+                # if game_len % 2 == 1:
+                #     activation = -1 * activation
+                feature_activations[feature_num].append(activation)
 
     num_captured = 0
+    disentangled = 0
     captured_set = set()
+    disentangled_learned = set()
     correlations = {}
     for board_feature in board_features:
+        num_occurrences = [x for x in board_features[board_feature] if x == 1]
+        if len(num_occurrences) < 10:
+            print(f"Occurences of {board_feature}: {len(num_occurrences)}")
         correlations[board_feature] = {}
         for feature_num in feature_activations:
-            correlation = spearmanr(feature_activations[feature_num], board_features[board_feature])
+            correlation = pointbiserialr(board_features[board_feature], feature_activations[feature_num])
             correlations[board_feature][feature_num] = correlation
+            """
+            # use quantiles to set activation threshold for classification
+            feature_frequency = len([x for x in board_features[board_feature] if x == 1]) / len(board_features[board_feature])
+            activation_threshold = max(feature_activations[feature_num]) * (1 - feature_frequency)
+            activation_threshold = np.percentile(feature_activations[feature_num], (1-feature_frequency)*100)
+            classifications = [int(x>activation_threshold) for x in feature_activations[feature_num]]
+            num_correct = np.equal(classifications, board_features[board_feature]).sum()
+            if num_correct / len(board_features[board_feature]) >= .95:
+            """
             if correlation[1] < significance_threshold:
+                if feature_num not in disentangled_learned:
+                    disentangled += 1
+                    disentangled_learned.update([feature_num])
                 # print(board_feature, feature_num, correlation)
                 if board_feature not in captured_set:
                     num_captured += 1
                     captured_set.update([board_feature])
             
     print(f"Captured features: {num_captured} / {num_latents} ({(num_captured/num_latents) * 100:.2f}%)")
+    print(f"Disentangled learned features: {disentangled} / {len(feature_activations)} ({disentangled/len(feature_activations)*100:.2f}%)")
     return correlations
     # print(correlations)
 
@@ -969,7 +1015,11 @@ if __name__ == "__main__":
     parser.add_argument("dict_location", type=str, help="Path to learned_dict.pt")
     parser.add_argument("--feature_proportion", "-p", type=float, default=10,
                         help="Proportion of features to analyze (0 < p <= 100).")
+    parser.add_argument("--significance_threshold", "-s", type=float, default=.05,
+                        help="Significance threshold at which a correlation is considered to have captured "
+                              "a feature.")
     args = parser.parse_args()
 
     feature_proportion = args.feature_proportion / 100
-    interpret_othello(args.dict_location, feature_proportion)
+    interpret_othello(args.dict_location, feat_proportion=feature_proportion,
+                      significance_threshold=args.significance_threshold)
